@@ -8,6 +8,20 @@ INTERNAL="eDP-1"
 WALL="$HOME/Pictures/wallpapers/Lofi-Room.png"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/dphotplug.log"
 
+# --watch: daemon mode (started from i3), re-runs this script on every DRM change event
+if [[ "${1:-}" == "--watch" ]]; then
+  exec 8>"${XDG_RUNTIME_DIR:-/tmp}/dphotplug-watch.lock"
+  flock -n 8 || exit 0
+  "$0" --no-wait
+  udevadm monitor --udev --subsystem-match=drm 2>/dev/null | while read -r line; do
+    [[ "$line" == *change* ]] || continue
+    sleep 2
+    while read -r -t 1 _; do :; done
+    "$0"
+  done
+  exit 0
+fi
+
 exec 9>"${XDG_RUNTIME_DIR:-/tmp}/dphotplug.lock"
 flock 9
 
@@ -32,8 +46,20 @@ done < <(xrandr --query | awk '$2=="disconnected" {print $1}')
 
 if [[ -n "$EXTERNAL" ]]; then
   log "external=$EXTERNAL -> dual"
+  # Already in the desired layout -> do nothing (re-applying/toggling breaks the MST 2K mode)
+  link_bad() { xrandr --verbose | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ \t]/{f=0} f && /link-status: Bad/{b=1} END{exit !b}'; }
+  if link_bad; then
+    log "link-status Bad -> requesting retrain"
+    xrandr --output "$EXTERNAL" --set link-status Good 2>>"$LOG" || true
+    sleep 1
+  fi
+  if ! link_bad && xrandr --query | grep -q "^$EXTERNAL connected primary 2560x1440+1920+0" \
+     && xrandr --query | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ ]/{f=0} f && $1=="2560x1440"{ok=1} END{exit !ok}'; then
+    log "already configured, skipping"
+    exit 0
+  fi
   has_2k() { xrandr --query | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ ]/{f=0} f && $1=="2560x1440"{ok=1} END{exit !ok}'; }
-  for _ in 1 2 3; do has_2k && break; sleep 2; done
+  for _ in $(seq 1 8); do has_2k && break; sleep 2; done
   if ! has_2k; then
     log "2560x1440 missing (degraded dock link) -> 1920x1080"
     xrandr "${off_args[@]}" --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
@@ -42,7 +68,6 @@ if [[ -n "$EXTERNAL" ]]; then
     feh --bg-scale "$WALL" 2>/dev/null || true
     exit 0
   fi
-  xrandr --output "$EXTERNAL" --off 2>>"$LOG" || true
   if ! xrandr "${off_args[@]}" \
       --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
       --output "$EXTERNAL" --mode 2560x1440 --pos 1920x0 --primary 2>>"$LOG"; then

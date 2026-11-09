@@ -1,0 +1,62 @@
+#!/bin/sh
+# If i915 brought the dock MST link up too slow to carry 2560x1440 (the mode is
+# missing from the connector's mode list), force HBR2 and retrain the link.
+# Does nothing when 2K is already available - retraining a working link breaks it.
+# Only the link rate is forced; the lane count is left to the driver
+# (forcing lanes makes link training fail with no fallback -> flicker/black screen).
+D=/sys/kernel/debug/dri/0/DP-2
+RATE=540000
+MODE=2560x1440
+COOLDOWN=30
+STAMP=/run/dock-dp-retrain.last
+
+[ -e "$D/i915_dp_force_link_rate" ] || exit 0
+
+exec 9>/run/dock-dp-retrain.lock
+flock -n 9 || exit 0
+
+cur() { sed -n 's/.* \[\{0,1\}\([0-9]*\)\*.*/\1/p' "$D/$1"; }
+
+# connected external DP connectors (MST ports of the dock show up as card0-DP-N)
+ext_connected() {
+  for c in /sys/class/drm/card0-DP-*; do
+    [ "$(cat "$c/status" 2>/dev/null)" = connected ] && return 0
+  done
+  return 1
+}
+has_mode() {
+  for c in /sys/class/drm/card0-DP-*; do
+    [ "$(cat "$c/status" 2>/dev/null)" = connected ] && grep -qx "$MODE" "$c/modes" && return 0
+  done
+  return 1
+}
+
+sleep 4   # let the dock / MST hub settle after docking
+
+ext_connected || exit 0
+has_mode && exit 0
+
+# retraining itself emits DRM change events -> don't loop on our own events
+now=$(date +%s)
+last=$(cat "$STAMP" 2>/dev/null || echo 0)
+[ $((now - last)) -ge "$COOLDOWN" ] || exit 0
+
+for i in 1 2 3; do
+  logger -t dock-dp-retrain "$MODE missing, link $(cur i915_dp_force_link_rate)x$(cur i915_dp_force_lane_count), retraining at HBR2 (try $i)"
+  echo auto    > "$D/i915_dp_force_lane_count"
+  echo "$RATE" > "$D/i915_dp_force_link_rate"
+  echo 1       > "$D/i915_dp_force_link_retrain"
+  date +%s > "$STAMP"
+  sleep 3
+  # mode list is only refreshed on the next probe (dphotplug runs xrandr --query),
+  # so judge success by the link parameters here
+  if [ "$(cur i915_dp_force_link_rate)" = "$RATE" ] && [ "$(cur i915_dp_force_lane_count)" -ge 2 ] 2>/dev/null; then
+    logger -t dock-dp-retrain "link up at $(cur i915_dp_force_link_rate)x$(cur i915_dp_force_lane_count)"
+    # poke userspace so dphotplug --watch re-applies the 2K layout
+    udevadm trigger --action=change --subsystem-match=drm --sysname-match=card0
+    exit 0
+  fi
+done
+# give the driver its own choice back so the next dock starts clean
+echo auto > "$D/i915_dp_force_link_rate"
+logger -t dock-dp-retrain "could not get $MODE, link rate back to auto"

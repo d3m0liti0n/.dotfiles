@@ -1,0 +1,2 @@
+# Retrain the ThinkPad dock DP/MST link to HBR2 whenever displays change
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card0", RUN+="/usr/bin/systemd-run --no-block --collect /usr/local/sbin/dock-dp-retrain"
