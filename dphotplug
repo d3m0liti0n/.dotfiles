@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+
+INTERNAL="eDP-1"
+WALL="$HOME/Pictures/wallpapers/Lofi-Room.png"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/dphotplug.log"
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/dphotplug.lock"
+flock 9
+
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+
+find_external() {
+  xrandr --query | awk -v i="$INTERNAL" '$2=="connected" && $1!=i {print $1; exit}'
+}
+
+EXTERNAL=""
+for _ in $(seq 1 10); do
+  EXTERNAL="$(find_external)"
+  [[ -n "$EXTERNAL" ]] && break
+  [[ "${1:-}" == "--no-wait" ]] && break
+  sleep 1
+done
+
+off_args=()
+while read -r out; do
+  off_args+=(--output "$out" --off)
+done < <(xrandr --query | awk '$2=="disconnected" {print $1}')
+
+if [[ -n "$EXTERNAL" ]]; then
+  log "external=$EXTERNAL -> dual"
+  has_2k() { xrandr --query | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ ]/{f=0} f && $1=="2560x1440"{ok=1} END{exit !ok}'; }
+  for _ in 1 2 3; do has_2k && break; sleep 2; done
+  if ! has_2k; then
+    log "2560x1440 missing (degraded dock link) -> 1920x1080"
+    xrandr "${off_args[@]}" --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
+           --output "$EXTERNAL" --mode 1920x1080 --right-of "$INTERNAL" --primary 2>>"$LOG" || true
+    notify-send -u critical "Dock: degraded DP link" "2560x1440 is unavailable. Undock and re-dock the laptop." 2>/dev/null || true
+    feh --bg-scale "$WALL" 2>/dev/null || true
+    exit 0
+  fi
+  xrandr --output "$EXTERNAL" --off 2>>"$LOG" || true
+  if ! xrandr "${off_args[@]}" \
+      --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
+      --output "$EXTERNAL" --mode 2560x1440 --pos 1920x0 --primary 2>>"$LOG"; then
+    log "fixed mode failed, fallback to --auto"
+    xrandr --output "$INTERNAL" --auto --pos 0x0 \
+           --output "$EXTERNAL" --auto --right-of "$INTERNAL" --primary 2>>"$LOG" || true
+  fi
+else
+  log "no external -> laptop only"
+  xrandr "${off_args[@]}" --output "$INTERNAL" --auto --pos 0x0 --primary 2>>"$LOG" || true
+fi
+
+feh --bg-scale "$WALL" 2>/dev/null || true
