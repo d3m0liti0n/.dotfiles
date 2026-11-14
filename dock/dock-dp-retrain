@@ -1,62 +1,55 @@
 #!/bin/sh
-# If i915 brought the dock MST link up too slow to carry 2560x1440 (the mode is
-# missing from the connector's mode list), force HBR2 and retrain the link.
-# Does nothing when 2K is already available - retraining a working link breaks it.
-# Only the link rate is forced; the lane count is left to the driver
-# (forcing lanes makes link training fail with no fallback -> flicker/black screen).
+# The second DP lane to the dock only equalises on some link-training attempts.
+# i915 gives a 2-lane link just two tries per modeset and then drops to 1 lane,
+# which cannot carry 2560x1440. This script keeps retraining (rate forced to HBR2,
+# lane count left to the driver) until the link is up on 2+ lanes, or gives up.
+# While it works it holds $BUSY so that dphotplug leaves the output alone.
 D=/sys/kernel/debug/dri/0/DP-2
 RATE=540000
-MODE=2560x1440
-COOLDOWN=30
-STAMP=/run/dock-dp-retrain.last
+TRIES=8
+BUSY=/run/dock-dp-retrain.busy
+GAVEUP=/run/dock-dp-retrain.gaveup
 
-[ -e "$D/i915_dp_force_link_rate" ] || exit 0
+[ -e "$D/i915_dp_force_link_retrain" ] || exit 0
 
 exec 9>/run/dock-dp-retrain.lock
 flock -n 9 || exit 0
 
-cur() { sed -n 's/.* \[\{0,1\}\([0-9]*\)\*.*/\1/p' "$D/$1"; }
-
-# connected external DP connectors (MST ports of the dock show up as card0-DP-N)
 ext_connected() {
   for c in /sys/class/drm/card0-DP-*; do
     [ "$(cat "$c/status" 2>/dev/null)" = connected ] && return 0
   done
   return 1
 }
-has_mode() {
-  for c in /sys/class/drm/card0-DP-*; do
-    [ "$(cat "$c/status" 2>/dev/null)" = connected ] && grep -qx "$MODE" "$c/modes" && return 0
-  done
-  return 1
-}
+max_lanes() { cat "$D/i915_dp_max_lane_count" 2>/dev/null || echo 0; }
+lanes_ok() { [ "$(max_lanes)" -ge 2 ] 2>/dev/null; }
+poke() { udevadm trigger --action=change --subsystem-match=drm --sysname-match=card0; }
 
-sleep 4   # let the dock / MST hub settle after docking
+sleep 3
+if ! ext_connected; then rm -f "$GAVEUP"; exit 0; fi
+lanes_ok && exit 0
+[ -e "$GAVEUP" ] && exit 0        # already gave up for this docking
 
-ext_connected || exit 0
-has_mode && exit 0
+trap 'rm -f "$BUSY"' EXIT
+: > "$BUSY"
 
-# retraining itself emits DRM change events -> don't loop on our own events
-now=$(date +%s)
-last=$(cat "$STAMP" 2>/dev/null || echo 0)
-[ $((now - last)) -ge "$COOLDOWN" ] || exit 0
-
-for i in 1 2 3; do
-  logger -t dock-dp-retrain "$MODE missing, link $(cur i915_dp_force_link_rate)x$(cur i915_dp_force_lane_count), retraining at HBR2 (try $i)"
+i=0
+while [ "$i" -lt "$TRIES" ]; do
+  i=$((i + 1))
+  ext_connected || exit 0
+  logger -t dock-dp-retrain "link limited to $(max_lanes) lane(s), retraining (try $i)"
   echo auto    > "$D/i915_dp_force_lane_count"
   echo "$RATE" > "$D/i915_dp_force_link_rate"
   echo 1       > "$D/i915_dp_force_link_retrain"
-  date +%s > "$STAMP"
-  sleep 3
-  # mode list is only refreshed on the next probe (dphotplug runs xrandr --query),
-  # so judge success by the link parameters here
-  if [ "$(cur i915_dp_force_link_rate)" = "$RATE" ] && [ "$(cur i915_dp_force_lane_count)" -ge 2 ] 2>/dev/null; then
-    logger -t dock-dp-retrain "link up at $(cur i915_dp_force_link_rate)x$(cur i915_dp_force_lane_count)"
-    # poke userspace so dphotplug --watch re-applies the 2K layout
-    udevadm trigger --action=change --subsystem-match=drm --sysname-match=card0
+  sleep 5
+  if lanes_ok; then
+    logger -t dock-dp-retrain "link up on $(max_lanes) lanes after $i tries"
+    rm -f "$BUSY"
+    poke        # let dphotplug switch to / confirm 2K
     exit 0
   fi
 done
-# give the driver its own choice back so the next dock starts clean
-echo auto > "$D/i915_dp_force_link_rate"
-logger -t dock-dp-retrain "could not get $MODE, link rate back to auto"
+: > "$GAVEUP"
+logger -t dock-dp-retrain "gave up after $TRIES tries, link stays on 1 lane"
+rm -f "$BUSY"
+poke            # let dphotplug fall back to 1920x1080

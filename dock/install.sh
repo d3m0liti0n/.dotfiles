@@ -14,6 +14,8 @@ install -m 755 "$DOCK_DIR/dock-dp-retrain" /usr/local/sbin/dock-dp-retrain
 install -m 644 "$DOCK_DIR/99-dock-dp-retrain.rules" /etc/udev/rules.d/99-dock-dp-retrain.rules
 udevadm control --reload
 echo "installed /usr/local/sbin/dock-dp-retrain and udev rule"
+# run the helper once now, in case the laptop is already docked on a 1-lane link
+udevadm trigger --action=change --subsystem-match=drm --sysname-match=card0
 
 # user part: symlinks owned by the user who ran sudo
 U="${SUDO_USER:?run via sudo from your user account}"

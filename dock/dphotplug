@@ -8,24 +8,33 @@ INTERNAL="eDP-1"
 WALL="$HOME/Pictures/wallpapers/Lofi-Room.png"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/dphotplug.log"
 
-# --watch: daemon mode (started from i3), re-runs this script on every DRM change event
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+
+# --watch: daemon mode (started from i3), re-runs this script on DRM change events
 if [[ "${1:-}" == "--watch" ]]; then
   exec 8>"${XDG_RUNTIME_DIR:-/tmp}/dphotplug-watch.lock"
   flock -n 8 || exit 0
+  ext_present() {
+    local s
+    for s in /sys/class/drm/card*-*/status; do
+      [[ "$s" == *"-$INTERNAL/"* ]] && continue
+      [[ "$(cat "$s" 2>/dev/null)" == connected ]] && return 0
+    done
+    return 1
+  }
   "$0" --no-wait
   udevadm monitor --udev --subsystem-match=drm 2>/dev/null | while read -r line; do
     [[ "$line" == *change* ]] || continue
     sleep 2
     while read -r -t 1 _; do :; done
-    "$0"
+    # undocked: switch to the laptop panel right away, docked: let the script wait for the monitor
+    if ext_present; then "$0"; else "$0" --no-wait; fi
   done
   exit 0
 fi
 
 exec 9>"${XDG_RUNTIME_DIR:-/tmp}/dphotplug.lock"
 flock 9
-
-log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
 
 find_external() {
   xrandr --query | awk -v i="$INTERNAL" '$2=="connected" && $1!=i {print $1; exit}'
@@ -45,35 +54,52 @@ while read -r out; do
 done < <(xrandr --query | awk '$2=="disconnected" {print $1}')
 
 if [[ -n "$EXTERNAL" ]]; then
-  log "external=$EXTERNAL -> dual"
-  # Already in the desired layout -> do nothing (re-applying/toggling breaks the MST 2K mode)
-  link_bad() { xrandr --verbose | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ \t]/{f=0} f && /link-status: Bad/{b=1} END{exit !b}'; }
-  if link_bad; then
-    log "link-status Bad -> requesting retrain"
-    xrandr --output "$EXTERNAL" --set link-status Good 2>>"$LOG" || true
-    sleep 1
-  fi
-  if ! link_bad && xrandr --query | grep -q "^$EXTERNAL connected primary 2560x1440+1920+0" \
-     && xrandr --query | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ ]/{f=0} f && $1=="2560x1440"{ok=1} END{exit !ok}'; then
-    log "already configured, skipping"
-    exit 0
-  fi
+  log "external=$EXTERNAL"
+  # dock-dp-retrain (root, started by udev) keeps retraining the dock link until it is up
+  # on 2 lanes; while it works it holds $BUSY and we must not touch the output.
+  BUSY=/run/dock-dp-retrain.busy
+  GAVEUP=/run/dock-dp-retrain.gaveup
   has_2k() { xrandr --query | awk -v o="$EXTERNAL" '$1==o{f=1;next} /^[^ ]/{f=0} f && $1=="2560x1440"{ok=1} END{exit !ok}'; }
-  for _ in $(seq 1 8); do has_2k && break; sleep 2; done
-  if ! has_2k; then
-    log "2560x1440 missing (degraded dock link) -> 1920x1080"
+  at_2k() { xrandr --query | grep -q "^$EXTERNAL connected primary 2560x1440+1920+0"; }
+  wait_retrain() {
+    # give the root helper up to $1 s to start (or 2K to show up), then wait until it is done
+    local i
+    for ((i = 0; i < $1; i++)); do { [[ -e $BUSY ]] || has_2k; } && break; sleep 1; done
+    for ((i = 0; i < 70; i++)); do [[ -e $BUSY ]] || break; sleep 1; done
+  }
+  set_1080() {
     xrandr "${off_args[@]}" --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
            --output "$EXTERNAL" --mode 1920x1080 --right-of "$INTERNAL" --primary 2>>"$LOG" || true
-    notify-send -u critical "Dock: degraded DP link" "2560x1440 is unavailable. Undock and re-dock the laptop." 2>/dev/null || true
-    feh --bg-scale "$WALL" 2>/dev/null || true
-    exit 0
-  fi
-  if ! xrandr "${off_args[@]}" \
-      --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
-      --output "$EXTERNAL" --mode 2560x1440 --pos 1920x0 --primary 2>>"$LOG"; then
-    log "fixed mode failed, fallback to --auto"
-    xrandr --output "$INTERNAL" --auto --pos 0x0 \
-           --output "$EXTERNAL" --auto --right-of "$INTERNAL" --primary 2>>"$LOG" || true
+  }
+
+  wait_retrain 0
+  if at_2k; then
+    if has_2k; then
+      log "already at 2K"
+    else
+      # X has 2K configured, but the link dropped to 1 lane and the kernel removed the mode
+      wait_retrain 8
+      if has_2k; then
+        log "2K link recovered"
+      else
+        log "2K link lost -> 1920x1080"
+        set_1080
+        notify-send -u critical "Dock: degraded DP link" "2560x1440 is unavailable. Undock and re-dock the laptop." 2>/dev/null || true
+      fi
+    fi
+  elif has_2k; then
+    log "-> 2560x1440"
+    xrandr "${off_args[@]}" \
+        --output "$INTERNAL" --mode 1920x1080 --pos 0x0 \
+        --output "$EXTERNAL" --mode 2560x1440 --pos 1920x0 --primary 2>>"$LOG" || log "setting 2K failed"
+  else
+    # 2K not offered (1-lane link). Light the output at 1080p: the root helper can only
+    # retrain a link that is in use, and will poke us again once 2 lanes are up.
+    log "2K not offered -> 1920x1080 for now"
+    set_1080
+    if [[ -e $GAVEUP ]]; then
+      notify-send -u critical "Dock: degraded DP link" "2560x1440 is unavailable. Undock and re-dock the laptop." 2>/dev/null || true
+    fi
   fi
 else
   log "no external -> laptop only"
