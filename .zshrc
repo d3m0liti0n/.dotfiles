@@ -4,7 +4,7 @@
 # Path to your Oh My Zsh installation.
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="fino"
-plugins=(git)
+plugins=(git web-search uv uv-env)
 
 source $ZSH/oh-my-zsh.sh
 
@@ -65,3 +65,6 @@ fi
 
 add-zsh-hook precmd _tmux_rename
 add-zsh-hook preexec _tmux_rename
+
+# opencode
+export PATH=/home/pawa/.opencode/bin:$PATH

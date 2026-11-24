@@ -2,7 +2,6 @@ local vim = vim
 vim.g.mapleader = " "
 vim.o.nu = true
 vim.o.rnu = true
-vim.o.termguicolors = true
 vim.o.ignorecase = true
 vim.o.smartcase = true
 vim.o.cursorline = true
@@ -12,9 +11,11 @@ vim.o.shiftwidth = 4
 vim.o.expandtab = true
 vim.o.list = true
 vim.opt.listchars = { tab = "  ", trail = "_" }
+vim.o.autocomplete = true
+vim.opt.complete:prepend("o")
 
 vim.o.clipboard = "unnamedplus"
-vim.cmd("set completeopt+=noselect")
+vim.o.completeopt = "menuone,noselect,popup"
 
 -- Built-in package manager (Neovim 0.12+)
 vim.pack.add({
@@ -28,80 +29,34 @@ vim.pack.add({
     { src = "https://github.com/tpope/vim-fugitive" },
 })
 
--- Plugin setup (safe pcall)
-pcall(vim.cmd.colorscheme, "catppuccin-mocha")
+-- Plugin setup
+vim.cmd.colorscheme("catppuccin-mocha")
 
-do
-    local ok, hl = pcall(require, "hlsearch")
-    if ok then hl.setup() end
-end
+require("hlsearch").setup()
+require("oil").setup()
+require("mini.pick").setup({
+    mappings = { choose_marked = "<C-q>" },
+})
+require("conform").setup({
+    formatters_by_ft = {
+        python = { "ruff_organize_imports", "ruff_format" },
+    },
+    format_on_save = {
+        lsp_format = "fallback",
+        timeout_ms = 1000,
+    },
+})
 
-do
-    local ok, oil = pcall(require, "oil")
-    if ok then oil.setup() end
-end
-
-do
-    local ok, pick = pcall(require, "mini.pick")
-    if ok then
-        pick.setup({
-            mappings = { choose_marked = "<C-q>" },
-        })
-    end
-end
-
-do
-    local ok, conform = pcall(require, "conform")
-    if ok then
-        conform.setup({
-            formatters_by_ft = {
-                python = { "ruff_organize_imports", "ruff_format" },
-            },
-            format_on_save = {
-                lsp_fallback = true,
-                timeout_ms = 1000,
-            },
-        })
-    end
-end
-
-do
-    local ok, ts = pcall(require, "nvim-treesitter.configs")
-    if ok then
-        ts.setup({
-            ensure_installed = { "python", "lua", "markdown", "vimdoc" },
-            highlight = { enable = true },
-        })
-    end
-end
+require("nvim-treesitter").install({ "python" })
+vim.api.nvim_create_autocmd("FileType", {
+    pattern = "python",
+    callback = function() pcall(vim.treesitter.start) end,
+})
 
 -- LSP
-vim.api.nvim_create_autocmd("LspAttach", {
-    callback = function(ev)
-        local client = vim.lsp.get_client_by_id(ev.data.client_id)
-        if client and client:supports_method("textDocument/completion") then
-            vim.lsp.completion.enable(true, client.id, ev.buf, { autotrigger = true })
-        end
-    end,
-})
-
-vim.lsp.config("lua_ls", {})
-
-vim.lsp.config("jedi_language_server", {
-    on_attach = function(_, bufnr)
-        vim.api.nvim_create_autocmd("CursorHold", {
-            buffer = bufnr,
-            callback = function()
-                vim.lsp.buf.hover()
-            end,
-        })
-    end,
-})
-
 vim.lsp.config("ruff", {
     init_options = {
         settings = {
-            lint = { enable = true },
             configurationPreference = "filesystemFirst",
         },
     },
@@ -118,8 +73,6 @@ vim.diagnostic.config({
             return diagnostic.message
         end,
     },
-    signs = true,
-    update_in_insert = false,
 })
 
 -- Keymaps
